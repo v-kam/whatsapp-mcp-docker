@@ -1,8 +1,25 @@
+# MCP server entry point for the WhatsApp integration.
+# Defines all FastMCP tool handlers (contacts, messages, chats, media) and
+# delegates data access to whatsapp.py. Transport is selected at startup via
+# MCP_TRANSPORT (stdio | sse | streamable-http); HTTP transports additionally
+# respect MCP_HOST and MCP_PORT for bind address and port.
+# Every tool is wrapped with @track_calls so usage is recorded in
+# mcp_stats.db for the pairing UI's "Tools" tab.
+#
+# For HTTP transports we wrap FastMCP's Starlette app with a BearerAuthMiddleware
+# (auth.py) that validates Authorization: Bearer <token> against the token file
+# managed by the Go bridge. The token can be regenerated from the pairing UI
+# without restarting this process — the middleware re-reads the file on every
+# request.
+
+import os
 import signal
 import sys
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+
+from stats import register_tools_in_db, track_calls
 
 from whatsapp import (
     download_media as whatsapp_download_media,
@@ -32,6 +49,12 @@ from whatsapp import (
     list_messages as whatsapp_list_messages,
 )
 from whatsapp import (
+    list_unread_chats as whatsapp_list_unread_chats,
+)
+from whatsapp import (
+    mark_chat_read as whatsapp_mark_chat_read,
+)
+from whatsapp import (
     search_contacts as whatsapp_search_contacts,
 )
 from whatsapp import (
@@ -49,6 +72,7 @@ mcp = FastMCP("whatsapp")
 
 
 @mcp.tool()
+@track_calls
 def search_contacts(query: str) -> list[dict[str, Any]]:
     """Search WhatsApp contacts by name or phone number.
 
@@ -60,6 +84,7 @@ def search_contacts(query: str) -> list[dict[str, Any]]:
 
 
 @mcp.tool()
+@track_calls
 def get_contact(
     identifier: str | None = None,
     phone_number: str | None = None,
@@ -156,6 +181,7 @@ def get_contact(
 
 
 @mcp.tool()
+@track_calls
 def list_messages(
     after: str | None = None,
     before: str | None = None,
@@ -205,6 +231,7 @@ def list_messages(
 
 
 @mcp.tool()
+@track_calls
 def list_chats(
     query: str | None = None,
     limit: int = 50,
@@ -230,6 +257,39 @@ def list_chats(
 
 
 @mcp.tool()
+@track_calls
+def list_unread_chats(limit: int = 50, include_last_message: bool = True) -> list[dict[str, Any]]:
+    """List WhatsApp chats with unread messages, most recent first.
+
+    The bridge tracks unread state live: every incoming message increments
+    the chat's counter, and the counter resets when your phone (or another
+    linked device) marks the chat as read or when you send a message yourself.
+
+    Args:
+        limit: Max chats to return (default 50, max 200)
+        include_last_message: Include the last message preview (default True)
+    """
+    limit = min(limit, 200)
+    return whatsapp_list_unread_chats(limit=limit, include_last_message=include_last_message)
+
+
+@mcp.tool()
+@track_calls
+def mark_chat_read(chat_jid: str) -> dict[str, Any]:
+    """Mark all incoming messages in a chat as read on WhatsApp.
+
+    Sends WhatsApp read receipts (blue ticks for the sender, clears the
+    unread badge on your phone) and resets the local unread counter.
+
+    Args:
+        chat_jid: Full chat JID (e.g. "1234567890@s.whatsapp.net" or "<id>@g.us")
+    """
+    success, message = whatsapp_mark_chat_read(chat_jid)
+    return {"success": success, "message": message}
+
+
+@mcp.tool()
+@track_calls
 def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]:
     """Get WhatsApp chat metadata by JID.
 
@@ -242,6 +302,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
 
 
 @mcp.tool()
+@track_calls
 def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any]:
     """Get WhatsApp chat metadata by sender phone number.
 
@@ -253,6 +314,7 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@track_calls
 def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str, Any]]:
     """Get all WhatsApp chats involving the contact.
 
@@ -266,6 +328,7 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> list[dict[str
 
 
 @mcp.tool()
+@track_calls
 def get_last_interaction(jid: str) -> dict[str, Any]:
     """Get most recent WhatsApp message involving the contact.
 
@@ -280,6 +343,7 @@ def get_last_interaction(jid: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@track_calls
 def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dict[str, Any]:
     """Get context around a specific WhatsApp message.
 
@@ -293,6 +357,7 @@ def get_message_context(message_id: str, before: int = 5, after: int = 5) -> dic
 
 
 @mcp.tool()
+@track_calls
 def send_message(recipient: str, message: str) -> dict[str, Any]:
     """Send a WhatsApp message to a person or group. For group chats use the JID.
 
@@ -314,6 +379,7 @@ def send_message(recipient: str, message: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@track_calls
 def send_file(recipient: str, media_path: str) -> dict[str, Any]:
     """Send a file such as a picture, raw audio, video or document via WhatsApp to the specified recipient. For group messages use the JID.
 
@@ -332,6 +398,7 @@ def send_file(recipient: str, media_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@track_calls
 def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 
@@ -348,6 +415,7 @@ def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+@track_calls
 def download_media(message_id: str, chat_jid: str) -> dict[str, Any]:
     """Download media from a WhatsApp message and get the local file path.
 
@@ -376,5 +444,37 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown_handler)
     signal.signal(signal.SIGTERM, shutdown_handler)
 
-    # Initialize and run the server
-    mcp.run(transport="stdio")
+    # Persist the tool registry so all tools appear in the UI even before
+    # any of them have been called.
+    register_tools_in_db()
+
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+
+    if transport == "stdio":
+        # stdio = subprocess transport, no network → no auth needed.
+        mcp.run(transport="stdio")
+    elif transport in ("sse", "streamable-http"):
+        # We need to attach a Starlette middleware for bearer-token auth, so
+        # we go one level under mcp.run() and drive uvicorn ourselves.
+        import uvicorn
+
+        from auth import BearerAuthMiddleware
+
+        host = os.getenv("MCP_HOST", "0.0.0.0")
+        port = int(os.getenv("MCP_PORT", "8000"))
+        mcp.settings.host = host
+        mcp.settings.port = port
+
+        if transport == "sse":
+            app = mcp.sse_app()
+        else:
+            app = mcp.streamable_http_app()
+
+        # add_middleware mutates app.user_middleware; the actual stack is built
+        # lazily on the first request, so this is safe before uvicorn.run.
+        app.add_middleware(BearerAuthMiddleware)
+
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    else:
+        print(f"Unknown MCP_TRANSPORT: {transport!r}", file=sys.stderr)
+        sys.exit(1)

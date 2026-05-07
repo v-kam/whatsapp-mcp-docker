@@ -102,6 +102,12 @@ A failing blocking job is a hard block — fix it or explain in the PR why it's 
 | `WHATSAPP_BRIDGE_PORT` | `8080` | Port the bridge binds to |
 | `WEBHOOK_URL` | `http://localhost:8769/whatsapp/webhook` | Outgoing webhook for incoming messages (empty = disabled) |
 | `FORWARD_SELF` | `false` | Whether self-sent messages are forwarded |
+| `MCP_TRANSPORT` | `stdio` | MCP transport: `stdio`, `sse`, or `streamable-http` |
+| `MCP_HOST` | `0.0.0.0` | Bind host used when `MCP_TRANSPORT` is `sse` or `streamable-http` |
+| `MCP_PORT` | `8000` | Listen port used when `MCP_TRANSPORT` is `sse` or `streamable-http` |
+| `WHATSAPP_UI_PORT` | `3000` | Port for the pairing web UI (Go bridge, `0.0.0.0`); open in browser to scan QR |
+| `MCP_STATS_DB_PATH` | `../whatsapp-bridge/store/mcp_stats.db` | SQLite DB for MCP tool-call counters; written by Python (`@track_calls`), read by Go (`/api/ui/tools`) |
+| `MCP_AUTH_TOKEN_PATH` | `store/auth_token` (Go) / `../whatsapp-bridge/store/auth_token` (Python) | Bearer-token file. Go writes it (`auth.go`, mode 0600), Python reads it on every request (`auth.py`). Rotated via `POST /api/ui/regenerate-token`. Ignored for `stdio`. |
 
 When adding a new env var: document it here, in `README.md`, and in `.env.example`.
 

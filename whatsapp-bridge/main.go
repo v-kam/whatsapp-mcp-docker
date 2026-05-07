@@ -139,7 +139,37 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// Idempotent migration: add the unread_count column if missing.
+	// "duplicate column name" is the SQLite error for an existing column.
+	if _, err := db.Exec(`ALTER TABLE chats ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0`); err != nil {
+		if !strings.Contains(err.Error(), "duplicate column name") {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to migrate chats.unread_count: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
+}
+
+// IncrementUnreadCount bumps the unread counter for the given chat by 1.
+// Called when an incoming (not-from-me) message arrives.
+func (store *MessageStore) IncrementUnreadCount(chatJID string) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET unread_count = unread_count + 1 WHERE jid = ?`,
+		chatJID,
+	)
+	return err
+}
+
+// ResetUnreadCount sets the unread counter to 0 for the given chat.
+// Called when the phone marks the chat as read (events.Receipt) or when
+// the user calls /api/mark_read explicitly.
+func (store *MessageStore) ResetUnreadCount(chatJID string) error {
+	_, err := store.db.Exec(
+		`UPDATE chats SET unread_count = 0 WHERE jid = ?`,
+		chatJID,
+	)
+	return err
 }
 
 // MigrateLegacyLIDChatsToPhoneJIDs rewrites message/chat rows stored under
@@ -1092,6 +1122,19 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		logger.Warnf("Failed to store message: %v", err)
 	}
 
+	// Track unread count.
+	// Incoming non-self messages bump the counter; if we sent the message
+	// ourselves (from any device) we treat the chat as read and reset it.
+	if msg.Info.IsFromMe {
+		if err := messageStore.ResetUnreadCount(chatJID); err != nil {
+			logger.Warnf("Failed to reset unread count for %s: %v", chatJID, err)
+		}
+	} else {
+		if err := messageStore.IncrementUnreadCount(chatJID); err != nil {
+			logger.Warnf("Failed to increment unread count for %s: %v", chatJID, err)
+		}
+	}
+
 	// For image messages, download media synchronously so we can include the base64
 	// payload in the webhook. Other media types (video, audio, document) are still
 	// downloaded asynchronously since they are not passed to the AI vision pipeline.
@@ -1519,6 +1562,105 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for sending typing indicator
+	http.HandleFunc("/api/mark_read", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+
+		chatJID, err := types.ParseJID(req.ChatJID)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Error parsing chat_jid: %v", err),
+			})
+			return
+		}
+
+		// Pull the most recent incoming messages so we know which IDs to ack.
+		// 50 covers the WhatsApp UI's typical unread badge cap. We group by
+		// sender because group chats need MarkRead called per sender.
+		rows, err := messageStore.db.Query(
+			`SELECT id, sender FROM messages
+			 WHERE chat_jid = ? AND is_from_me = 0
+			 ORDER BY timestamp DESC
+			 LIMIT 50`,
+			req.ChatJID,
+		)
+		if err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success": false,
+				"message": fmt.Sprintf("Failed to query messages: %v", err),
+			})
+			return
+		}
+
+		idsBySender := map[string][]types.MessageID{}
+		for rows.Next() {
+			var id, sender string
+			if err := rows.Scan(&id, &sender); err != nil {
+				continue
+			}
+			idsBySender[sender] = append(idsBySender[sender], types.MessageID(id))
+		}
+		_ = rows.Close()
+
+		ctx := context.Background()
+		now := time.Now()
+		ackedTotal := 0
+		var ackErr error
+		for senderUser, ids := range idsBySender {
+			if len(ids) == 0 {
+				continue
+			}
+			senderJID := types.JID{User: senderUser, Server: chatJID.Server}
+			// For DMs the per-message sender equals the chat partner; for
+			// groups it varies. whatsmeow accepts both forms.
+			if err := client.MarkRead(ctx, ids, now, chatJID, senderJID); err != nil {
+				ackErr = err
+				continue
+			}
+			ackedTotal += len(ids)
+		}
+
+		// Always reset our local counter even if some sender buckets failed —
+		// the user has clearly indicated they consider the chat read.
+		if err := messageStore.ResetUnreadCount(req.ChatJID); err != nil {
+			fmt.Printf("Warning: failed to reset unread count for %s: %v\n", req.ChatJID, err)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		if ackErr != nil && ackedTotal == 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"success":     false,
+				"message":     fmt.Sprintf("MarkRead failed: %v", ackErr),
+				"acked_count": ackedTotal,
+			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":     true,
+			"message":     fmt.Sprintf("Marked %d message(s) as read", ackedTotal),
+			"acked_count": ackedTotal,
+		})
+	})
+
 	http.HandleFunc("/api/typing", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
@@ -1636,6 +1778,12 @@ func main() {
 		logger.Errorf("Failed to create store directory: %v", err)
 		return
 	}
+
+	// Start the pairing web UI early so users can open a browser to scan the
+	// QR code instead of needing a terminal. The UI server runs independently
+	// of the main REST API (which starts only after pairing).
+	uiPort := getEnvInt("WHATSAPP_UI_PORT", 3000)
+	StartUIServer(uiPort, "ui")
 
 	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -1760,6 +1908,22 @@ func main() {
 		case *events.Connected:
 			logger.Infof("✓ Successfully connected to WhatsApp servers")
 
+		case *events.Receipt:
+			// The phone (or another linked device) marked one or more
+			// messages as read. ReceiptTypeRead is what arrives when *we*
+			// read on another device; the field IsFromMe distinguishes it
+			// from receipts about our outgoing messages being read by the
+			// peer (those we ignore for unread tracking).
+			if v.Type == types.ReceiptTypeRead || v.Type == types.ReceiptTypeReadSelf {
+				resolvedChat := resolveLIDChat(client, v.Chat, v.SenderAlt, v.RecipientAlt, v.IsFromMe)
+				chatJID := resolvedChat.String()
+				if err := messageStore.ResetUnreadCount(chatJID); err != nil {
+					logger.Warnf("Failed to reset unread count on receipt for %s: %v", chatJID, err)
+				} else {
+					logger.Debugf("Reset unread count for %s (receipt type=%s)", chatJID, v.Type)
+				}
+			}
+
 		case *events.LoggedOut:
 			logger.Warnf("⚠️  Device logged out, please scan QR code to log in again")
 
@@ -1847,13 +2011,18 @@ func main() {
 			qrCodeShown := false
 			for evt := range qrChan {
 				if evt.Event == "code" {
+					// Always update the web UI with the latest QR code
+					// (WhatsApp refreshes it every ~20 s if not scanned).
+					pairing.Update("qr", evt.Code)
 					if !qrCodeShown {
 						fmt.Println("\nScan this QR code with your WhatsApp app:")
 						qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-						fmt.Println("\nWaiting for QR code scan...")
+						fmt.Printf("\nOr open http://localhost:%d in your browser.\n", uiPort)
+						fmt.Println("Waiting for QR code scan...")
 						qrCodeShown = true
 					}
 				} else if evt.Event == "success" {
+					pairing.Update("connected", "")
 					connected <- true
 					break
 				} else if evt.Event == "timeout" {
@@ -1887,6 +2056,7 @@ func main() {
 				time.Sleep(5 * time.Second)
 				continue
 			}
+			pairing.Update("connected", "")
 			connected <- true
 			break
 		}

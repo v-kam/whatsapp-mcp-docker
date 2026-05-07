@@ -42,6 +42,7 @@ class Chat:
     last_message: str | None = None
     last_sender: str | None = None
     last_is_from_me: bool | None = None
+    unread_count: int = 0
 
     @property
     def is_group(self) -> bool:
@@ -109,6 +110,7 @@ def chat_to_dict(chat: "Chat") -> dict[str, Any]:
         "last_message": chat.last_message,
         "last_sender": chat.last_sender,
         "last_is_from_me": chat.last_is_from_me,
+        "unread_count": chat.unread_count,
     }
 
 
@@ -580,7 +582,8 @@ def list_chats(
                 chats.last_message_time,
                 messages.content as last_message,
                 messages.sender as last_sender,
-                messages.is_from_me as last_is_from_me
+                messages.is_from_me as last_is_from_me,
+                COALESCE(chats.unread_count, 0) as unread_count
             FROM chats
         """
         ]
@@ -625,6 +628,7 @@ def list_chats(
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
                 last_is_from_me=chat_data[5],
+                unread_count=chat_data[6] or 0,
             )
             result.append(chat_to_dict(chat))
 
@@ -636,6 +640,87 @@ def list_chats(
     finally:
         if "conn" in locals():
             conn.close()
+
+
+def list_unread_chats(limit: int = 50, include_last_message: bool = True) -> list[dict[str, Any]]:
+    """Get only chats with unread messages, ordered by recency.
+
+    The bridge updates `chats.unread_count` live: it is incremented on every
+    incoming message and reset whenever the phone (any linked device) marks
+    the chat as read or whenever we send a message ourselves.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+
+        join_clause = ""
+        if include_last_message:
+            join_clause = """
+                LEFT JOIN messages ON chats.jid = messages.chat_jid
+                AND chats.last_message_time = messages.timestamp
+            """
+
+        cursor.execute(
+            f"""
+            SELECT
+                chats.jid,
+                chats.name,
+                chats.last_message_time,
+                messages.content as last_message,
+                messages.sender as last_sender,
+                messages.is_from_me as last_is_from_me,
+                COALESCE(chats.unread_count, 0) as unread_count
+            FROM chats
+            {join_clause}
+            WHERE COALESCE(chats.unread_count, 0) > 0
+            ORDER BY chats.last_message_time DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+        rows = cursor.fetchall()
+
+        result = []
+        for row in rows:
+            chat = Chat(
+                jid=row[0],
+                name=row[1],
+                last_message_time=datetime.fromisoformat(row[2]) if row[2] else None,
+                last_message=row[3],
+                last_sender=row[4],
+                last_is_from_me=row[5],
+                unread_count=row[6] or 0,
+            )
+            result.append(chat_to_dict(chat))
+
+        return result
+
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        return []
+    finally:
+        if "conn" in locals():
+            conn.close()
+
+
+def mark_chat_read(chat_jid: str) -> tuple[bool, str]:
+    """Mark all incoming messages in a chat as read on WhatsApp.
+
+    Calls the bridge's /api/mark_read which both sends WhatsApp read receipts
+    (so the sender sees blue ticks and your phone clears the unread badge)
+    and resets the local unread_count to 0.
+    """
+    try:
+        url = f"{WHATSAPP_API_BASE_URL}/mark_read"
+        response = requests.post(url, json={"chat_jid": chat_jid})
+        if response.status_code != 200:
+            return False, f"Error: HTTP {response.status_code} - {response.text}"
+        result = response.json()
+        return result.get("success", False), result.get("message", "Unknown response")
+    except requests.RequestException as e:
+        return False, f"Request error: {str(e)}"
+    except json.JSONDecodeError:
+        return False, f"Error parsing response: {response.text}"
 
 
 def search_contacts(query: str) -> list[dict[str, Any]]:
@@ -845,7 +930,8 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                COALESCE(c.unread_count, 0) as unread_count
             FROM chats c
         """
 
@@ -870,6 +956,7 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> dict[str, Any]
             last_message=chat_data[3],
             last_sender=chat_data[4],
             last_is_from_me=chat_data[5],
+            unread_count=chat_data[6] or 0,
         )
         return chat_to_dict(chat)
 

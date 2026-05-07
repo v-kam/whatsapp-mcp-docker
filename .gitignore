@@ -17,6 +17,8 @@ claude_desktop_config.json
 # Node
 node_modules/
 package-lock.json
+# Track the UI lockfile for reproducible Docker builds
+!whatsapp-ui/package-lock.json
 
 # Go binaries
 whatsapp-bridge/whatsapp-bridge
@@ -52,3 +54,4 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+.cursor/

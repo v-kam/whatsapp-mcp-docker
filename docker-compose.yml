@@ -1,0 +1,74 @@
+# docker-compose.yml — quick-start Compose file for the WhatsApp MCP container.
+#
+# Usage:
+#   1. (Optional) cp .env.example .env  and tweak values
+#   2. docker compose up -d --build
+#   3. Open http://localhost:3000 in your browser
+#        - Status tab:  scan the QR code with WhatsApp -> Linked Devices
+#        - Connect tab: copy the bearer-token-protected JSON into your MCP client
+#                       (Cursor: ~/.cursor/mcp.json, Claude Desktop: claude_desktop_config.json)
+#                       The token can be rotated from the same tab.
+#        - Tools tab:   live tool-call counters
+#
+# All persistent data (SQLite DBs, media, the auth token, the WhatsApp session)
+# lives in the named volume `whatsapp-data`. Removing the container leaves it
+# intact; remove the volume to force a fresh pairing.
+#
+# Hardening tips (uncomment in the `ports:` block):
+#   - Bind ports to 127.0.0.1 to keep the server off the LAN.
+#   - Or remove the UI port mapping entirely once you have copied the token,
+#     and keep only the bearer-protected MCP port exposed.
+
+services:
+  whatsapp-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: whatsapp-mcp:latest
+    container_name: whatsapp-mcp
+    restart: unless-stopped
+
+    ports:
+      # Pairing + connection-details web UI (Go bridge, port 3000 in-container).
+      # For LAN-only deployments, change to "127.0.0.1:${WHATSAPP_UI_PORT:-3000}:3000"
+      # so only the host can reach the QR code and the bearer token.
+      - "${WHATSAPP_UI_PORT:-3000}:3000"
+
+      # MCP HTTP transport (sse or streamable-http, depending on MCP_TRANSPORT).
+      # Protected by the bearer token shown in the UI's Connect tab.
+      - "${MCP_PORT:-8000}:8000"
+
+    volumes:
+      # Persist messages.db, whatsapp.db, mcp_stats.db, auth_token, media.
+      # The container creates this directory with the right structure on first run.
+      - whatsapp-data:/app/whatsapp-bridge/store
+
+    environment:
+      # Transport: stdio | sse | streamable-http
+      # stdio is for clients that spawn the container as a subprocess (Claude Desktop).
+      # sse / streamable-http give you a long-running daemon you connect to over HTTP.
+      MCP_TRANSPORT: ${MCP_TRANSPORT:-sse}
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8000
+
+      WHATSAPP_UI_PORT: 3000
+
+      # Don't replay messages the user sent themselves through the webhook.
+      FORWARD_SELF: ${FORWARD_SELF:-false}
+
+      # Optional outgoing webhook for incoming messages (empty = disabled).
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+
+    # The UI server starts immediately, well before WhatsApp pairing finishes,
+    # so we use it as a readiness signal. The `start_period` covers the time
+    # for the Go bridge to compile its first SQLite migrations.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/api/ui/status"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+
+volumes:
+  whatsapp-data:
+    name: whatsapp-data

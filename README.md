@@ -29,6 +29,113 @@ A Model Context Protocol (MCP) server for WhatsApp, enabling Claude to read and 
 - Claude Desktop or Cursor
 - FFmpeg (optional, for voice message conversion)
 
+### Docker (recommended for isolated / always-on setups)
+
+Docker bundles the Go bridge and Python MCP server into a single image. No local Go or Python installation needed.
+
+#### Build the image
+
+```bash
+git clone https://github.com/verygoodplugins/whatsapp-mcp.git
+cd whatsapp-mcp
+docker build -t whatsapp-mcp .
+```
+
+#### Step 1 — pair your phone (one-time, browser-based)
+
+Start the container with the pairing UI port exposed:
+
+```bash
+docker run --rm \
+  -p 3000:3000 \
+  -v whatsapp-data:/app/whatsapp-bridge/store \
+  whatsapp-mcp
+```
+
+Open **http://localhost:3000** in your browser. A QR code will appear once the bridge is ready. Scan it in WhatsApp → Settings → Linked Devices → Link a Device. The page updates automatically when pairing succeeds — then stop the container with `Ctrl+C`.
+
+#### Step 2a — stdio mode (Cursor / Claude Desktop)
+
+The AI client spawns the container as a subprocess. Add to your MCP config:
+
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+
+```json
+{
+  "mcpServers": {
+    "whatsapp": {
+      "command": "docker",
+      "args": [
+        "run", "-i", "--rm",
+        "-v", "whatsapp-data:/app/whatsapp-bridge/store",
+        "-e", "FORWARD_SELF=false",
+        "whatsapp-mcp"
+      ]
+    }
+  }
+}
+```
+
+**Cursor** (`~/.cursor/mcp.json`):
+
+```json
+{
+  "mcp": {
+    "servers": {
+      "whatsapp": {
+        "command": "docker",
+        "args": [
+          "run", "-i", "--rm",
+          "-v", "whatsapp-data:/app/whatsapp-bridge/store",
+          "-e", "FORWARD_SELF=false",
+          "whatsapp-mcp"
+        ]
+      }
+    }
+  }
+}
+```
+
+#### Step 2b — HTTP/SSE mode (long-running daemon)
+
+Run the container in the background and connect any HTTP-capable MCP client to it:
+
+```bash
+docker run -d --name whatsapp-mcp \
+  -p 3000:3000 \
+  -p 8000:8000 \
+  -v whatsapp-data:/app/whatsapp-bridge/store \
+  -e MCP_TRANSPORT=sse \
+  -e FORWARD_SELF=false \
+  whatsapp-mcp
+```
+
+Both HTTP transports require a **bearer token** on every request. A token is auto-generated on first start and persisted in the volume (`store/auth_token`, mode 0600). Open the pairing UI at `http://localhost:3000`, switch to the **Connect** tab, and copy the JSON snippet — it already includes the correct `Authorization: Bearer <token>` header for Cursor / Claude Desktop. From the same tab you can rotate the token; the change takes effect on the next request without restarting the container.
+
+```jsonc
+{
+  "mcpServers": {
+    "whatsapp": {
+      "url": "http://localhost:8000/sse",
+      "transport": "sse",
+      "headers": {
+        "Authorization": "Bearer <token-from-ui>"
+      }
+    }
+  }
+}
+```
+
+For the newer streamable-HTTP protocol, use `-e MCP_TRANSPORT=streamable-http` and connect to `http://localhost:8000/mcp`.
+
+#### Updating the Docker image
+
+```bash
+git pull
+docker build -t whatsapp-mcp .
+# restart the container (data in the named volume is preserved)
+```
+
 ### Quick Start
 
 1. **Clone the repository**
@@ -271,6 +378,12 @@ Copy `.env.example` to `.env` and configure as needed:
 | `WHATSAPP_DB_PATH`     | `../whatsapp-bridge/store/messages.db`   | Path to SQLite database                      |
 | `WHATSMEOW_DB_PATH`    | `../whatsapp-bridge/store/whatsapp.db`   | whatsmeow DB used for LID ↔ phone resolution |
 | `WHATSAPP_API_URL`     | `http://localhost:8080/api`              | Go bridge REST API URL                       |
+| `MCP_TRANSPORT`        | `stdio`                                  | MCP transport: `stdio`, `sse`, or `streamable-http` |
+| `MCP_HOST`             | `0.0.0.0`                                | Bind host for HTTP/SSE transports            |
+| `MCP_PORT`             | `8000`                                   | Listen port for HTTP/SSE transports          |
+| `WHATSAPP_UI_PORT`     | `3000`                                   | Port for the pairing web UI (open in browser to scan QR) |
+| `MCP_STATS_DB_PATH`    | `../whatsapp-bridge/store/mcp_stats.db`  | Tool-call counters DB shown in the UI's Tools tab |
+| `MCP_AUTH_TOKEN_PATH`  | `store/auth_token` (Go) / `../whatsapp-bridge/store/auth_token` (Python) | Bearer-token file shared between bridge and MCP middleware (HTTP transports only) |
 
 ### CLI flags (Go bridge)
 
